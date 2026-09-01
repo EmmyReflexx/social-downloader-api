@@ -1,23 +1,19 @@
 import os
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
 from yt_dlp import YoutubeDL
 
 app = FastAPI(
     title="Universal Media Extractor API",
-    description="API to extract media data, images, and video metadata from social links using yt-dlp"
+    description="API to extract media data, images, and video metadata from social links via GET request"
 )
-
-class ExtractRequest(BaseModel):
-    url: str
 
 @app.get("/")
 def read_root():
     return {"status": "running", "message": "Social media extractor API is active."}
 
-@app.post("/extract")
-def extract_media(payload: ExtractRequest):
-    url = payload.url
+# Changed from POST to GET, and switched path to /download to match your screenshot
+@app.get("/download")
+def extract_media(url: str = Query(..., description="The social media URL to extract")):
     if not url:
         raise HTTPException(status_code=400, detail="URL parameter is required.")
 
@@ -53,7 +49,7 @@ def extract_media(payload: ExtractRequest):
                     if 'url' in t:
                         images.append(t['url'])
                         
-            # Handle child entries for multi-image posts or carousels
+            # Handle child entries for multi-image posts or carousels (IG / Reddit)
             if 'entries' in sanitized_info:
                 for entry in sanitized_info['entries']:
                     if entry and 'thumbnail' in entry:
