@@ -4,7 +4,7 @@ from yt_dlp import YoutubeDL
 
 app = FastAPI(
     title="Social Media Media Extractor API",
-    description="Clean API to grab clean download links and images from social networks"
+    description="Clean API separating responses strictly between image assets and video links"
 )
 
 @app.get("/")
@@ -28,11 +28,16 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
         'dump_single_json': True,     
         'no_warnings': True,
         'quiet': True,
+        'ignoreerrors': True,
     }
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            
+            if not info:
+                raise HTTPException(status_code=400, detail="Could not extract data from this URL. It may be private or invalid.")
+                
             sanitized_info = ydl.sanitize_info(info)
             
             # --- 1. Gather all high-res/base images safely ---
@@ -44,61 +49,72 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
                     if 'url' in t:
                         images.append(t['url'])
                         
-            # Pull image arrays out of slider/carousel posts (Instagram/Reddit)
             if 'entries' in sanitized_info:
                 for entry in sanitized_info['entries']:
-                    if entry and 'thumbnail' in entry:
-                        images.append(entry['thumbnail'])
-                    if entry and 'thumbnails' in entry:
-                        images.extend([t['url'] for t in entry['thumbnails'] if 'url' in t])
+                    if entry:
+                        if 'url' in entry and any(ext in entry['url'].lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', 'heic']):
+                            images.append(entry['url'])
+                        if 'thumbnail' in entry and entry['thumbnail']:
+                            images.append(entry['thumbnail'])
+                        if 'thumbnails' in entry:
+                            images.extend([t['url'] for t in entry['thumbnails'] if 'url' in t])
 
-            # Clean and deduplicate image urls
             images = list(dict.fromkeys(images))
 
-            # --- 2. Isolate Video and Audio Download Streams ---
+            # --- 2. Isolate Video and Audio Download Streams Safely ---
             video_link = None
             audio_link = None
             
-            # If yt-dlp extracted direct download formats (YouTube, TikTok, Facebook, etc.)
             formats = sanitized_info.get('formats', [])
+            if formats:
+                video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('url')]
+                if video_formats:
+                    video_link = video_formats[-1]['url']
+                
+                audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url')]
+                if audio_formats:
+                    audio_link = audio_formats[-1]['url']
             
-            # Find the best standalone video (or combined video+audio stream)
-            video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('url')]
-            if video_formats:
-                # Target the highest quality available format URL
-                video_link = video_formats[-1]['url']
-            elif sanitized_info.get('url'):
-                # Fallback if there's only one direct asset URL at the root level
-                video_link = sanitized_info['url']
+            if not video_link and sanitized_info.get('url'):
+                root_url = sanitized_info['url']
+                if not any(ext in root_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                    video_link = root_url
 
-            # Find the best audio-only stream (for background tracking or music)
-            audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url')]
-            if audio_formats:
-                audio_link = audio_formats[-1]['url']
-
-            # --- 3. Extract Meta Details ---
-            main_thumbnail = sanitized_info.get("thumbnail") or (images[0] if images else None)
-            
+            # --- 3. Extract Metadata Fields ---
+            main_thumbnail = sanitized_info.get("thumbnail") or (images if images else None)
             author = (
                 sanitized_info.get("uploader") or 
                 sanitized_info.get("uploader_id") or 
                 sanitized_info.get("channel") or 
                 sanitized_info.get("author")
             )
-            
             platform = sanitized_info.get("extractor_key") or sanitized_info.get("extractor")
+            title = sanitized_info.get("title") or sanitized_info.get("description", "")[:50]
 
-            # --- 4. Clean Payload Response ---
-            return {
-                "success": True,
-                "platform": platform,
-                "title": sanitized_info.get("title") or sanitized_info.get("description", "")[:50],
-                "author": author,
-                "thumbnail": main_thumbnail,
-                "video_link": video_link,
-                "audio_link": audio_link,
-                "images": images
-            }
+            # --- 4. Structure Output Dynamically ---
+            is_video = video_link is not None
+
+            if is_video:
+                # Video JSON layout format
+                return {
+                    "success": True,
+                    "platform": platform,
+                    "title": title,
+                    "author": author,
+                    "thumbnail": main_thumbnail,
+                    "video_link": video_link,
+                    "audio_link": audio_link,
+                    "images": None
+                }
+            else:
+                # Pure Image JSON layout format (No thumbnail, video link, or audio link keys)
+                return {
+                    "success": True,
+                    "platform": platform,
+                    "title": title,
+                    "author": author,
+                    "images": images
+                }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
