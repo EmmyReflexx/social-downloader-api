@@ -3,21 +3,19 @@ from fastapi import FastAPI, HTTPException, Query
 from yt_dlp import YoutubeDL
 
 app = FastAPI(
-    title="Universal Media Extractor API",
-    description="API to extract media data, images, and video metadata from social links via GET request"
+    title="Social Media Media Extractor API",
+    description="Clean API to grab clean download links and images from social networks"
 )
 
 @app.get("/")
 def read_root():
-    return {"status": "running", "message": "Social media extractor API is active."}
+    return {"status": "running", "message": "API is online."}
 
-# Changed from POST to GET, and switched path to /download to match your screenshot
 @app.get("/download")
 def extract_media(url: str = Query(..., description="The social media URL to extract")):
     if not url:
         raise HTTPException(status_code=400, detail="URL parameter is required.")
 
-    # Configure yt-dlp to mimic a modern browser and extract full data
     ydl_opts = {
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -25,22 +23,19 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
             'Accept-Language': 'en-US,en;q=0.9',
             'Sec-Fetch-Mode': 'navigate',
         },
-        'skip_download': True,        # Do not download files to Render storage
-        'extract_flat': False,        # Fully evaluate playlists/galleries
-        'dump_single_json': True,     # Gather raw response data mapping
+        'skip_download': True,        
+        'extract_flat': False,        
+        'dump_single_json': True,     
         'no_warnings': True,
         'quiet': True,
     }
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
-            # Extract full info dictionary
             info = ydl.extract_info(url, download=False)
-            
-            # Sanitize the info dict to make it safe for JSON serialization
             sanitized_info = ydl.sanitize_info(info)
             
-            # 1. Collect all available image variations
+            # --- 1. Gather all high-res/base images safely ---
             images = []
             if 'thumbnail' in sanitized_info and sanitized_info['thumbnail']:
                 images.append(sanitized_info['thumbnail'])
@@ -49,7 +44,7 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
                     if 'url' in t:
                         images.append(t['url'])
                         
-            # Handle child entries for multi-image posts or carousels (IG / Reddit)
+            # Pull image arrays out of slider/carousel posts (Instagram/Reddit)
             if 'entries' in sanitized_info:
                 for entry in sanitized_info['entries']:
                     if entry and 'thumbnail' in entry:
@@ -57,14 +52,33 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
                     if entry and 'thumbnails' in entry:
                         images.extend([t['url'] for t in entry['thumbnails'] if 'url' in t])
 
-            # Deduplicate image URLs
+            # Clean and deduplicate image urls
             images = list(dict.fromkeys(images))
 
-            # 2. Extract requested key fields with robust fallbacks
-            main_thumbnail = sanitized_info.get("thumbnail") or (images[0] if images else None)
-            duration = sanitized_info.get("duration")  # Length of video in seconds (returns None for text/image posts)
+            # --- 2. Isolate Video and Audio Download Streams ---
+            video_link = None
+            audio_link = None
             
-            # Fallback chains for author details across various platforms
+            # If yt-dlp extracted direct download formats (YouTube, TikTok, Facebook, etc.)
+            formats = sanitized_info.get('formats', [])
+            
+            # Find the best standalone video (or combined video+audio stream)
+            video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('url')]
+            if video_formats:
+                # Target the highest quality available format URL
+                video_link = video_formats[-1]['url']
+            elif sanitized_info.get('url'):
+                # Fallback if there's only one direct asset URL at the root level
+                video_link = sanitized_info['url']
+
+            # Find the best audio-only stream (for background tracking or music)
+            audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url')]
+            if audio_formats:
+                audio_link = audio_formats[-1]['url']
+
+            # --- 3. Extract Meta Details ---
+            main_thumbnail = sanitized_info.get("thumbnail") or (images[0] if images else None)
+            
             author = (
                 sanitized_info.get("uploader") or 
                 sanitized_info.get("uploader_id") or 
@@ -72,18 +86,18 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
                 sanitized_info.get("author")
             )
             
-            # Identity of the engine/platform processing the URL
             platform = sanitized_info.get("extractor_key") or sanitized_info.get("extractor")
 
+            # --- 4. Clean Payload Response ---
             return {
                 "success": True,
-                "title": sanitized_info.get("title") or sanitized_info.get("description", "")[:50],
                 "platform": platform,
+                "title": sanitized_info.get("title") or sanitized_info.get("description", "")[:50],
                 "author": author,
-                "duration_seconds": duration,
                 "thumbnail": main_thumbnail,
-                "all_images": images,
-                "raw_data": sanitized_info
+                "video_link": video_link,
+                "audio_link": audio_link,
+                "images": images
             }
 
     except Exception as e:
