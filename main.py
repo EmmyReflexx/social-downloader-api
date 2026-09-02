@@ -14,13 +14,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Shared browser identity string to bypass basic automation firewalls
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+
 def extract_images_via_gallery_dl(url: str) -> list:
     """
-    Calls the system gallery-dl binary to cleanly pull image source URLs.
+    Calls the system gallery-dl binary while explicitly injecting a valid 
+    browser user-agent to bypass platform access blocks.
     """
     try:
-        # -g / --get-urls outputs direct, clean URLs line-by-line
-        cmd = ["gallery-dl", "-g", "--ignore-errors", url]
+        # -g outputs clean raw links line-by-line
+        # --http-user-agent tricks Instagram into thinking gallery-dl is a real chrome browser
+        cmd = [
+            "gallery-dl", 
+            "-g", 
+            "--ignore-errors", 
+            "--http-user-agent", USER_AGENT,
+            url
+        ]
+        
         result = subprocess.run(
             cmd, 
             stdout=subprocess.PIPE, 
@@ -30,7 +42,6 @@ def extract_images_via_gallery_dl(url: str) -> list:
         )
         
         if result.stdout:
-            # Parse links, removing empty lines and ensuring they start with http
             links = [line.strip() for line in result.stdout.split('\n') if line.strip().startswith("http")]
             return links
         return []
@@ -44,12 +55,16 @@ def home():
 @app.get("/download")
 @app.get("/extract")
 def extract_media(url: str = Query(..., description="The social media URL to extract")):
-    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        # Do not use ignoreerrors here so yt-dlp triggers a clear DownloadError on image-only posts
+        'http_headers': {
+            'User-Agent': USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Sec-Fetch-Mode': 'navigate',
+        },
     }
 
     try:
@@ -59,35 +74,31 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
             if not info:
                 raise Exception("Empty metadata returned by yt-dlp.")
 
-            # Base dictionary structure always present
             response_data = {
                 "title": info.get("title") or info.get("description", "")[:50] or "Social Media Post",
                 "author": info.get("uploader") or info.get("channel") or "Unknown",
                 "thumbnail": info.get("thumbnail"),
             }
 
-            # If it's a known image extension or explicit photo platform metadata format
+            # If it's explicitly identified as an image container by lack of formats
             if info.get('ext') in ['jpg', 'png', 'webp'] or not info.get('formats'):
                 raise yt_dlp.utils.DownloadError("Detected image post format.")
 
-            # Isolate video and audio streaming URLs
+            # Isolate video streams
             formats = info.get("formats", [])
             video_link = None
             audio_link = None
 
-            # 1. Combined format matching
             for f in formats:
                 if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url"):
                     video_link = f.get("url")
                     break
 
-            # 2. Individual highest resolution track matching
             if not video_link:
                 video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
                 if video_formats:
                     video_link = video_formats[-1].get("url")
 
-            # 3. Audio track isolating
             for f in formats:
                 if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
                     audio_link = f.get("url")
@@ -96,29 +107,25 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
             if not video_link:
                 video_link = info.get("url")
 
-            # Validate we successfully pulled a video URL asset
             if video_link:
                 response_data["video_link"] = video_link
                 response_data["audio_link"] = audio_link or video_link
-                response_data["images"] = False  # Fixed layout setting for video responses
+                response_data["images"] = False  # Keep your fixed JSON structure
                 return response_data
             else:
-                # Force fallback to gallery-dl if video variables remain null
                 raise yt_dlp.utils.DownloadError("No streaming video container found.")
 
     except (yt_dlp.utils.DownloadError, Exception) as e:
         # ----------------------------------------------------
-        # FALLBACK ENGINE: EXECUTED IF YT-DLP ERRORS OUT OR IS AN IMAGE
+        # FALLBACK ENGINE: FIRES AUTOMATICALLY FOR IMAGES
         # ----------------------------------------------------
-        error_msg = str(e).lower()
-        
-        # We fetch fresh, basic headers via a safe flat extract if possible for our fallbacks
         fallback_title = "Social Media Image Post"
         fallback_author = "Unknown"
         fallback_thumb = None
         
+        # Pull soft metadata parameters flatly using the valid browser user agent
         try:
-            with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True, 'ignoreerrors': True}) as ydl_flat:
+            with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True, 'ignoreerrors': True, 'http_headers': {'User-Agent': USER_AGENT}}) as ydl_flat:
                 f_info = ydl_flat.extract_info(url, download=False)
                 if f_info:
                     fallback_title = f_info.get("title") or f_info.get("description", "")[:50] or fallback_title
@@ -127,7 +134,7 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
         except Exception:
             pass
 
-        # Trigger our specialized gallery-dl pipeline
+        # Extract with the upgraded header-injected gallery-dl function
         images = extract_images_via_gallery_dl(url)
 
         if images:
@@ -140,7 +147,7 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
                 "images": images
             }
         
-        # Absolute final safety fallback if gallery-dl returned nothing
+        # Final emergency array mapping if gallery-dl still returns nothing
         if fallback_thumb:
             return {
                 "title": fallback_title,
