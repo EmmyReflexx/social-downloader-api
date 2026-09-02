@@ -1,10 +1,9 @@
 import os
-import subprocess
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 
-app = FastAPI(title="Social Media Unified API")
+app = FastAPI(title="Social Media Video & Image Extractor API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,53 +13,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Shared browser identity string to bypass basic automation firewalls
-USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-
-def extract_images_via_gallery_dl(url: str) -> list:
-    """
-    Calls the system gallery-dl binary while explicitly injecting a valid 
-    browser user-agent to bypass platform access blocks.
-    """
-    try:
-        # -g outputs clean raw links line-by-line
-        # --http-user-agent tricks Instagram into thinking gallery-dl is a real chrome browser
-        cmd = [
-            "gallery-dl", 
-            "-g", 
-            "--ignore-errors", 
-            "--http-user-agent", USER_AGENT,
-            url
-        ]
-        
-        result = subprocess.run(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
-            text=True, 
-            timeout=30
-        )
-        
-        if result.stdout:
-            links = [line.strip() for line in result.stdout.split('\n') if line.strip().startswith("http")]
-            return links
-        return []
-    except Exception:
-        return []
-
 @app.get("/")
 def home():
-    return {"message": "API is online. Use /download or /extract with ?url=YOUR_URL"}
+    return {"message": "Extractor API is online. Use /download or /extract with ?url=YOUR_URL"}
 
 @app.get("/download")
 @app.get("/extract")
 def extract_media(url: str = Query(..., description="The social media URL to extract")):
+    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     
+    # We turn ON ignoreerrors so yt-dlp doesn't throw a hard crash on images, 
+    # allowing us to read the basic page metadata it managed to scrape.
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
+        'ignoreerrors': True,  
         'http_headers': {
-            'User-Agent': USER_AGENT,
+            'User-Agent': user_agent,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
             'Sec-Fetch-Mode': 'navigate',
@@ -72,90 +41,96 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
             info = ydl.extract_info(url, download=False)
             
             if not info:
-                raise Exception("Empty metadata returned by yt-dlp.")
+                raise HTTPException(status_code=404, detail="Could not extract metadata from this URL.")
 
+            # Base structural payload schema
             response_data = {
                 "title": info.get("title") or info.get("description", "")[:50] or "Social Media Post",
                 "author": info.get("uploader") or info.get("channel") or "Unknown",
                 "thumbnail": info.get("thumbnail"),
             }
 
-            # If it's explicitly identified as an image container by lack of formats
-            if info.get('ext') in ['jpg', 'png', 'webp'] or not info.get('formats'):
-                raise yt_dlp.utils.DownloadError("Detected image post format.")
-
-            # Isolate video streams
             formats = info.get("formats", [])
-            video_link = None
-            audio_link = None
+            
+            # Check if there are playable video tracks available
+            has_video_formats = any(f.get("vcodec") != "none" and f.get("url") for f in formats)
 
-            for f in formats:
-                if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url"):
-                    video_link = f.get("url")
-                    break
+            # ----------------------------------------------------
+            # 1. PERFECT VIDEO POST LOGIC
+            # ----------------------------------------------------
+            if has_video_formats:
+                video_link = None
+                audio_link = None
 
-            if not video_link:
-                video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
-                if video_formats:
-                    video_link = video_formats[-1].get("url")
+                # Look for combined streaming formats first
+                for f in formats:
+                    if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url"):
+                        video_link = f.get("url")
+                        break
 
-            for f in formats:
-                if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
-                    audio_link = f.get("url")
-                    break
+                # Fallback to the highest resolution single stream track
+                if not video_link:
+                    video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
+                    if video_formats:
+                        video_link = video_formats[-1].get("url")
 
-            if not video_link:
-                video_link = info.get("url")
+                # Isolate the independent audio layer
+                for f in formats:
+                    if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
+                        audio_link = f.get("url")
+                        break
 
-            if video_link:
+                if not video_link:
+                    video_link = info.get("url")
+
                 response_data["video_link"] = video_link
                 response_data["audio_link"] = audio_link or video_link
-                response_data["images"] = False  # Keep your fixed JSON structure
+                response_data["images"] = False  # Fixed layout flag for pure video objects
                 return response_data
+
+            # ----------------------------------------------------
+            # 2. OUR OWN SIMPLE IMAGE EXTRACTOR LOGIC
+            # ----------------------------------------------------
             else:
-                raise yt_dlp.utils.DownloadError("No streaming video container found.")
+                image_links = []
+                
+                # Check 1: Nested entries (for carousels/galleries on Reddit/Twitter)
+                entries = info.get("entries") or info.get("requested_downloads") or []
+                for entry in entries:
+                    if entry:
+                        img_url = entry.get("url") or entry.get("thumbnail")
+                        if img_url:
+                            image_links.append(img_url)
 
-    except (yt_dlp.utils.DownloadError, Exception) as e:
-        # ----------------------------------------------------
-        # FALLBACK ENGINE: FIRES AUTOMATICALLY FOR IMAGES
-        # ----------------------------------------------------
-        fallback_title = "Social Media Image Post"
-        fallback_author = "Unknown"
-        fallback_thumb = None
-        
-        # Pull soft metadata parameters flatly using the valid browser user agent
-        try:
-            with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True, 'ignoreerrors': True, 'http_headers': {'User-Agent': USER_AGENT}}) as ydl_flat:
-                f_info = ydl_flat.extract_info(url, download=False)
-                if f_info:
-                    fallback_title = f_info.get("title") or f_info.get("description", "")[:50] or fallback_title
-                    fallback_author = f_info.get("uploader") or f_info.get("channel") or fallback_author
-                    fallback_thumb = f_info.get("thumbnail")
-        except Exception:
-            pass
+                # Check 2: If entries are flat, pull all available thumbnail objects (Instagram fallback)
+                if not image_links:
+                    thumbnails = info.get("thumbnails") or []
+                    for t in thumbnails:
+                        if t.get("url"):
+                            image_links.append(t.get("url"))
 
-        # Extract with the upgraded header-injected gallery-dl function
-        images = extract_images_via_gallery_dl(url)
+                # Check 3: Root layout url fallback
+                if not image_links and info.get("url"):
+                    image_links.append(info.get("url"))
 
-        if images:
-            return {
-                "title": fallback_title,
-                "author": fallback_author,
-                "thumbnail": fallback_thumb or images[0],
-                "video_link": None,
-                "audio_link": None,
-                "images": images
-            }
-        
-        # Final emergency array mapping if gallery-dl still returns nothing
-        if fallback_thumb:
-            return {
-                "title": fallback_title,
-                "author": fallback_author,
-                "thumbnail": fallback_thumb,
-                "video_link": None,
-                "audio_link": None,
-                "images": [fallback_thumb]
-            }
+                # Filter out empty entries and any stray video stream parts
+                clean_images = []
+                for link in image_links:
+                    if link and not any(vid_ext in link.lower() for vid_ext in [".mp4", ".m3u8", ".mpd", "mime=video"]):
+                        if link not in clean_images:  # Remove duplicates
+                            clean_images.append(link)
 
-        raise HTTPException(status_code=400, detail=f"Extraction failed on both engines. Trace: {str(e)}")
+                # Format the response object exactly to match your JSON expectations
+                response_data["video_link"] = None
+                response_data["audio_link"] = None
+                response_data["images"] = clean_images if clean_images else [info.get("thumbnail")]
+                
+                return response_data
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server Processing Error: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
