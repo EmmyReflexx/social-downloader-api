@@ -1,11 +1,10 @@
 import os
 import subprocess
-import json
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 
-app = FastAPI(title="Social Media Hybrid Media Extractor API")
+app = FastAPI(title="Social Media Unified API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,24 +16,21 @@ app.add_middleware(
 
 def extract_images_via_gallery_dl(url: str) -> list:
     """
-    Spawns gallery-dl as a clean subprocess to extract image URLs 
-    using the exact text output formatting array (-g / --get-urls).
+    Calls the system gallery-dl binary to cleanly pull image source URLs.
     """
     try:
-        # -g returns only the raw direct source URLs to stdout line-by-line
-        # --ignore-errors prevents catastrophic script termination
+        # -g / --get-urls outputs direct, clean URLs line-by-line
         cmd = ["gallery-dl", "-g", "--ignore-errors", url]
-        
         result = subprocess.run(
             cmd, 
             stdout=subprocess.PIPE, 
             stderr=subprocess.PIPE, 
             text=True, 
-            timeout=25
+            timeout=30
         )
         
         if result.stdout:
-            # Split the line breaks and clear any empty strings or non-http anomalies
+            # Parse links, removing empty lines and ensuring they start with http
             links = [line.strip() for line in result.stdout.split('\n') if line.strip().startswith("http")]
             return links
         return []
@@ -43,23 +39,17 @@ def extract_images_via_gallery_dl(url: str) -> list:
 
 @app.get("/")
 def home():
-    return {"message": "Hybrid Extractor API is running. Use /download or /extract?url=YOUR_URL"}
+    return {"message": "API is online. Use /download or /extract with ?url=YOUR_URL"}
 
 @app.get("/download")
 @app.get("/extract")
 def extract_media(url: str = Query(..., description="The social media URL to extract")):
-    # Base user agent string profile to route through standard headers
     user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'ignoreerrors': True,
-        'http_headers': {
-            'User-Agent': user_agent,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-        },
+        # Do not use ignoreerrors here so yt-dlp triggers a clear DownloadError on image-only posts
     }
 
     try:
@@ -67,79 +57,98 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
             info = ydl.extract_info(url, download=False)
             
             if not info:
-                raise HTTPException(status_code=404, detail="Could not retrieve platform response headers.")
+                raise Exception("Empty metadata returned by yt-dlp.")
 
-            # Compile structural identity parameters
+            # Base dictionary structure always present
             response_data = {
                 "title": info.get("title") or info.get("description", "")[:50] or "Social Media Post",
                 "author": info.get("uploader") or info.get("channel") or "Unknown",
                 "thumbnail": info.get("thumbnail"),
             }
 
+            # If it's a known image extension or explicit photo platform metadata format
+            if info.get('ext') in ['jpg', 'png', 'webp'] or not info.get('formats'):
+                raise yt_dlp.utils.DownloadError("Detected image post format.")
+
+            # Isolate video and audio streaming URLs
             formats = info.get("formats", [])
+            video_link = None
+            audio_link = None
 
-            # ----------------------------------------------------
-            # ENGINE CHANGER ENGINE: IS IT A VIDEO POST?
-            # ----------------------------------------------------
-            # If valid audio/video container stream indices are mapped out by yt-dlp
-            has_video_formats = any(f.get("vcodec") != "none" and f.get("url") for f in formats)
+            # 1. Combined format matching
+            for f in formats:
+                if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url"):
+                    video_link = f.get("url")
+                    break
 
-            if has_video_formats and info.get("url") and not any(ext in info.get("url", "") for ext in [".jpg", ".png", ".webp"]):
-                video_link = None
-                audio_link = None
+            # 2. Individual highest resolution track matching
+            if not video_link:
+                video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
+                if video_formats:
+                    video_link = video_formats[-1].get("url")
 
-                # 1. Grab integrated stream audio + video trackers
-                for f in formats:
-                    if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url"):
-                        video_link = f.get("url")
-                        break
+            # 3. Audio track isolating
+            for f in formats:
+                if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
+                    audio_link = f.get("url")
+                    break
 
-                # 2. Pick the absolute highest standalone track if tracking separate files
-                if not video_link:
-                    video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
-                    if video_formats:
-                        video_link = video_formats[-1].get("url")
+            if not video_link:
+                video_link = info.get("url")
 
-                # 3. Pull standalone voice array 
-                for f in formats:
-                    if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
-                        audio_link = f.get("url")
-                        break
-
-                if not video_link:
-                    video_link = info.get("url")
-
+            # Validate we successfully pulled a video URL asset
+            if video_link:
                 response_data["video_link"] = video_link
                 response_data["audio_link"] = audio_link or video_link
+                response_data["images"] = False  # Fixed layout setting for video responses
                 return response_data
-
-            # ----------------------------------------------------
-            # ENGINE CHANGER ENGINE: IS IT AN IMAGE / CAROUSEL POST?
-            # ----------------------------------------------------
             else:
-                # Fire gallery-dl pipeline to safely crawl out structural layout resources
-                images = extract_images_via_gallery_dl(url)
-                
-                # If gallery-dl successfully grabbed clean links, drop them in
-                if images:
-                    response_data["images"] = images
-                else:
-                    # Smart fallback loop just in case gallery-dl yields an empty list
-                    fallback_links = []
-                    thumbnails = info.get("thumbnails", [])
-                    if thumbnails:
-                        fallback_links = [t.get("url") for t in thumbnails if t.get("url")]
-                    if not fallback_links and info.get("thumbnail"):
-                        fallback_links.append(info.get("thumbnail"))
-                    
-                    response_data["images"] = [l for l in fallback_links if l and not any(v in l for v in [".mp4", ".m3u8"])]
+                # Force fallback to gallery-dl if video variables remain null
+                raise yt_dlp.utils.DownloadError("No streaming video container found.")
 
-                return response_data
+    except (yt_dlp.utils.DownloadError, Exception) as e:
+        # ----------------------------------------------------
+        # FALLBACK ENGINE: EXECUTED IF YT-DLP ERRORS OUT OR IS AN IMAGE
+        # ----------------------------------------------------
+        error_msg = str(e).lower()
+        
+        # We fetch fresh, basic headers via a safe flat extract if possible for our fallbacks
+        fallback_title = "Social Media Image Post"
+        fallback_author = "Unknown"
+        fallback_thumb = None
+        
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True, 'ignoreerrors': True}) as ydl_flat:
+                f_info = ydl_flat.extract_info(url, download=False)
+                if f_info:
+                    fallback_title = f_info.get("title") or f_info.get("description", "")[:50] or fallback_title
+                    fallback_author = f_info.get("uploader") or f_info.get("channel") or fallback_author
+                    fallback_thumb = f_info.get("thumbnail")
+        except Exception:
+            pass
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Hybrid Routing Engine Error: {str(e)}")
+        # Trigger our specialized gallery-dl pipeline
+        images = extract_images_via_gallery_dl(url)
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+        if images:
+            return {
+                "title": fallback_title,
+                "author": fallback_author,
+                "thumbnail": fallback_thumb or images[0],
+                "video_link": None,
+                "audio_link": None,
+                "images": images
+            }
+        
+        # Absolute final safety fallback if gallery-dl returned nothing
+        if fallback_thumb:
+            return {
+                "title": fallback_title,
+                "author": fallback_author,
+                "thumbnail": fallback_thumb,
+                "video_link": None,
+                "audio_link": None,
+                "images": [fallback_thumb]
+            }
+
+        raise HTTPException(status_code=400, detail=f"Extraction failed on both engines. Trace: {str(e)}")
