@@ -1,4 +1,3 @@
 fastapi
 uvicorn
 yt-dlp
-curl_cffi
