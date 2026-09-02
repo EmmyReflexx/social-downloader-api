@@ -1,5 +1,5 @@
 import os
-import shutil
+import re
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,10 +15,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Shared User-Agent string to prevent blocks
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 
-# --- FIXED: Dedicated app-level directory to ensure reliable Render write permissions ---
 DOWNLOAD_DIR = os.path.abspath("./downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -30,32 +28,63 @@ def remove_file(path: str):
         except Exception:
             pass
 
+def sanitize_filename(name: str) -> str:
+    """Removes special characters, spaces, and emojis to ensure a safe file system path."""
+    if not name:
+        return "video"
+    clean = re.sub(r'[^a-zA-Z0-9\s\-_]', '', name)
+    clean = re.sub(r'\s+', '_', clean).strip('_')
+    return clean[:50]
+
 @app.get("/")
 def home():
     return {
         "message": "Extractor API is online.",
         "endpoints": {
             "metadata_extraction": "/extract?url=YOUR_URL",
-            "physical_download": "/download?url=YOUR_URL"
+            "physical_download": "/download?url=YOUR_URL&quality=best"
         }
     }
 
 @app.get("/download")
 def download_video(
     background_tasks: BackgroundTasks,
-    url: str = Query(..., description="The social media video URL to download directly")
+    url: str = Query(..., description="The social media video URL to download directly"),
+    quality: str = Query("best", description="Choose the video quality: 'best' or 'worst'")
 ):
     """
-    Downloads the video to the server disk and streams it directly to the client.
-    Triggers an automatic file download pop-up in the browser.
+    Downloads the video in either best or worst resolution quality and serves it 
+    named after the title as an instant browser attachment file.
     """
-    # Use our stable application-level directory path template
-    output_template = os.path.join(DOWNLOAD_DIR, 'dl_%(id)s.%(ext)s')
+    # 1. Map the request query input to the correct yt-dlp format parameter string
+    quality = quality.lower().strip()
+    if quality == "worst":
+        format_selector = "worstvideo+worstaudio/worst"
+    else:
+        format_selector = "best" # Fallback to best if unspecified
+
+    # 2. Fetch metadata first to grab the title for the filename
+    pre_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'http_headers': {'User-Agent': USER_AGENT}
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(pre_opts) as ydl_pre:
+            meta = ydl_pre.extract_info(url, download=False)
+            video_title = meta.get("title") or meta.get("description", "")[:30] or "social_video"
+            safe_title = sanitize_filename(video_title)
+    except Exception:
+        safe_title = "social_video"
+
+    # Set up our output path layout using the clean title template
+    output_template = os.path.join(DOWNLOAD_DIR, f'{safe_title}_%(id)s.%(ext)s')
 
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'format': 'best',
+        'format': format_selector, # --- FIXED: Maps dynamically to user request ---
         'outtmpl': output_template,
         'http_headers': {
             'User-Agent': USER_AGENT,
@@ -66,25 +95,25 @@ def download_video(
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Force the server to pull the full file down locally
             info = ydl.extract_info(url, download=True)
-            
-            # --- FIXED: Dynamically capture the actual filename extension ytdl chose ---
             filename = ydl.prepare_filename(info)
-            actual_ext = os.path.splitext(filename)[1] or ".mp4"
+            
+            # Extract actual container file extension ytdl saved (e.g. .mp4, .webm)
+            _, actual_ext = os.path.splitext(filename)
+            actual_ext = actual_ext or ".mp4"
             
             if not os.path.exists(filename):
                 raise HTTPException(status_code=500, detail="Downloaded file was not found on disk.")
 
-            # Queue cleanup so Render storage doesn't hit container memory limits
+            # Queue cleanup background task
             background_tasks.add_task(remove_file, filename)
 
-            # Generate a clean, matching extension name for the browser download bar
-            download_name = f"{info.get('id', 'video')}{actual_ext}"
+            # Assemble the download name with the user title and actual path extension
+            download_name = f"{safe_title}{actual_ext}"
 
             return FileResponse(
                 path=filename, 
-                media_type='application/octet-stream', # Forces a raw binary attachment download popup
+                media_type='application/octet-stream', 
                 filename=download_name
             )
 
@@ -95,9 +124,6 @@ def download_video(
 
 @app.get("/extract")
 def extract_metadata(url: str = Query(..., description="The social media video URL to extract info from")):
-    """
-    Extracts stream URLs and structural metadata without downloading the file itself.
-    """
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -124,25 +150,22 @@ def extract_metadata(url: str = Query(..., description="The social media video U
                 "duration": info.get("duration"),
                 "video_link": None,
                 "audio_link": None,
-                "images": False # Preserving your custom structural requirements
+                "images": False
             }
 
             video_link = None
             audio_link = None
 
-            # 1. Prioritize combined video + audio streams
             for f in formats:
                 if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url"):
                     video_link = f.get("url")
                     break
 
-            # 2. Fallback to video-only track
             if not video_link:
                 video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
                 if video_formats:
                     video_link = video_formats[-1].get("url")
 
-            # 3. Look for standalone audio stream
             for f in formats:
                 if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
                     audio_link = f.get("url")
