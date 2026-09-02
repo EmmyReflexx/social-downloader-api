@@ -5,7 +5,6 @@ import yt_dlp
 
 app = FastAPI(title="Social Media Video Extractor API")
 
-# Enable CORS for easy integration into frontends
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,11 +25,14 @@ def extract_video(url: str = Query(..., description="The social media video URL 
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
+        # 'format': 'best' forces yt-dlp to grab a universally compatible single stream link
+        'format': 'best',
         'http_headers': {
             'User-Agent': user_agent,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,video/webm,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
             'Sec-Fetch-Mode': 'navigate',
+            'Referer': 'https://tiktok.com',
         },
     }
 
@@ -41,15 +43,6 @@ def extract_video(url: str = Query(..., description="The social media video URL 
             if not info:
                 raise HTTPException(status_code=404, detail="Could not extract metadata from this URL.")
 
-            formats = info.get("formats", [])
-            
-            # Filter and verify that we actually have playable video formats
-            has_video_formats = any(f.get("vcodec") != "none" and f.get("url") for f in formats)
-            
-            # If no formats exist or it's a flat image post, throw a direct error
-            if not has_video_formats and not info.get("url"):
-                raise HTTPException(status_code=400, detail="The provided link does not contain a valid video stream.")
-
             # Base metadata schema
             response_data = {
                 "title": info.get("title") or info.get("description", "")[:50] or "Social Media Video",
@@ -57,36 +50,33 @@ def extract_video(url: str = Query(..., description="The social media video URL 
                 "thumbnail": info.get("thumbnail"),
             }
 
-            video_link = None
+            # TikTok specific check: TikTok usually stores its raw best direct link in info['url']
+            video_link = info.get("url")
             audio_link = None
 
-            # 1. Prioritize a combined format (contains both video and audio out of the box)
-            for f in formats:
-                if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url"):
-                    video_link = f.get("url")
-                    break
+            formats = info.get("formats", [])
+            
+            # If root url isn't found, look through formats list instead
+            if not video_link and formats:
+                for f in formats:
+                    if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url"):
+                        video_link = f.get("url")
+                        break
+                
+                if not video_link:
+                    video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
+                    if video_formats:
+                        video_link = video_formats[-1].get("url")
 
-            # 2. Fallback to the absolute highest quality video-only track if split
-            if not video_link:
-                video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
-                if video_formats:
-                    # yt-dlp lists formats from lowest to highest quality, pick the last one
-                    video_link = video_formats[-1].get("url")
-
-            # 3. Isolate the audio-only track if it exists separately
+            # Try to grab independent audio if available
             for f in formats:
                 if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
                     audio_link = f.get("url")
                     break
 
-            # Final check: Use root URL if formatting lookups skipped it
-            if not video_link:
-                video_link = info.get("url")
-
-            # Ensure we aren't sending back a bad asset link
             if video_link:
                 response_data["video_link"] = video_link
-                response_data["audio_link"] = audio_link or video_link  # Fallback to main track if audio doesn't split
+                response_data["audio_link"] = audio_link or video_link
                 return response_data
             else:
                 raise HTTPException(status_code=400, detail="Could not extract direct video streaming links.")
