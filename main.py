@@ -23,7 +23,7 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'ignoreerrors': True,  # Prevents crashing on image posts
+        'ignoreerrors': True,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -47,74 +47,78 @@ def extract_media(url: str = Query(..., description="The social media URL to ext
             }
 
             formats = info.get("formats", [])
-            entries = info.get("entries") or info.get("requested_downloads")
+            entries = info.get("entries")
 
-            # --- CASE 1: MULTI-IMAGE POSTS / CAROUSELS ---
-            # If there are sub-entries and they explicitly look like static image items
-            if entries and any(item.get('ext') in ['jpg', 'png', 'webp'] or 'image' in item.get('format_id', '') for item in entries if item):
+            # --- CASE 1: MULTI-IMAGE CAROUSELS / SUB-ENTRIES ---
+            if entries:
                 image_links = []
                 for entry in entries:
                     if entry:
+                        # Scan deep for direct image files inside nested playlist items
                         img_url = entry.get("url") or entry.get("thumbnail")
-                        if img_url:
+                        if img_url and not any(vid_ext in img_url for vid_ext in [".mp4", ".m3u8"]):
                             image_links.append(img_url)
                 
                 if image_links:
                     response_data["images"] = image_links
                     return response_data
 
-            # --- CASE 2: VIDEO EXTRACTOR FIXED BLOCK ---
-            # If formats list exists, we have an actual playable video track
+            # --- CASE 2: VIDEO EXTRACTOR (Your Perfect Video Code) ---
             if formats:
                 video_link = None
                 audio_link = None
 
-                # Look for a combined format (contains both video and audio) first for ease of streaming
                 for f in formats:
                     if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url"):
                         video_link = f.get("url")
                         break
 
-                # If no combined format found, pick the highest quality standalone video format
                 if not video_link:
                     video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
                     if video_formats:
-                        # Sort by resolution/quality if available, otherwise take the last one
                         video_link = video_formats[-1].get("url")
 
-                # Isolate a standalone audio stream if present
                 for f in formats:
                     if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
                         audio_link = f.get("url")
                         break
 
-                # Root fallback if our loops couldn't match a format but yt-dlp dropped a direct root url
                 if not video_link:
                     root_url = info.get("url")
                     if root_url and not any(ext in root_url for ext in [".jpg", ".png", ".webp"]):
                         video_link = root_url
 
-                # If we successfully caught a video link, assemble the video dictionary response
                 if video_link:
                     response_data["video_link"] = video_link
-                    response_data["audio_link"] = audio_link or video_link  # Fallback to video track if audio stream doesn't split
+                    response_data["audio_link"] = audio_link or video_link
                     return response_data
 
-            # --- CASE 3: STATIC SINGLE IMAGE FALLBACK ---
-            # Run this block if it has no video formats available 
-            thumbnails = info.get("thumbnails", [])
+            # --- CASE 3: STATIC SINGLE IMAGE / EXTENDED FALLBACK ---
+            # If it bypasses the video streams, extract the absolute highest resolution image URLs available
             image_links = []
             
-            if thumbnails:
+            # Check requested downloads array (where yt-dlp puts raw carousel items sometimes)
+            req_downloads = info.get("requested_downloads", [])
+            for download in req_downloads:
+                if download and download.get("url"):
+                    image_links.append(download.get("url"))
+
+            # Check raw thumbnails array
+            thumbnails = info.get("thumbnails", [])
+            if thumbnails and not image_links:
                 image_links = [t.get("url") for t in thumbnails if t.get("url")]
             
+            # Absolute root fallbacks
             if not image_links and info.get("thumbnail"):
                 image_links.append(info.get("thumbnail"))
                 
             if not image_links and info.get("url"):
                 image_links.append(info.get("url"))
 
-            response_data["images"] = image_links
+            # Filter out any lingering video stream chunks from your images list
+            clean_images = [link for link in image_links if link and not any(vid_ext in link for vid_ext in [".mp4", ".m3u8", ".mpd", "mime=video"])]
+            
+            response_data["images"] = clean_images
             return response_data
 
     except yt_dlp.utils.DownloadError as e:
