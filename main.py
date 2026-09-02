@@ -143,11 +143,18 @@ def extract_metadata(url: str = Query(..., description="The social media video U
 
             formats = info.get("formats", [])
             
+            # Identify sizing info from formats array safely
+            valid_sizes = [f.get("filesize") or f.get("filesize_approx") for f in formats if (f.get("filesize") or f.get("filesize_approx"))]
+            best_size = max(valid_sizes) if valid_sizes else None
+            worst_size = min(valid_sizes) if valid_sizes else None
+
             response_data = {
                 "title": info.get("title") or info.get("description", "")[:50] or "Social Media Video",
                 "author": info.get("uploader") or info.get("channel") or "Unknown",
                 "thumbnail": info.get("thumbnail"),
                 "duration": info.get("duration"),
+                "best_filesize_bytes": best_size,
+                "worst_filesize_bytes": worst_size,
                 "video_link": None,
                 "audio_link": None,
                 "images": False
