@@ -151,6 +151,7 @@ def extract_metadata(url: str = Query(..., description="The social media video U
             response_data = {
                 "title": info.get("title") or info.get("description", "")[:50] or "Social Media Video",
                 "author": info.get("uploader") or info.get("channel") or "Unknown",
+                "platform": info.get("extractor_key") or "Unknown",
                 "thumbnail": info.get("thumbnail"),
                 "duration": info.get("duration"),
                 "best_filesize_bytes": best_size,
