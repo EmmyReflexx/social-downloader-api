@@ -148,6 +148,13 @@ def extract_metadata(url: str = Query(..., description="The social media video U
             best_size = max(valid_sizes) if valid_sizes else None
             worst_size = min(valid_sizes) if valid_sizes else None
 
+            # Track down audio stream sizing safely
+            audio_size = None
+            for f in formats:
+                if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
+                    audio_size = f.get("filesize") or f.get("filesize_approx")
+                    break
+
             response_data = {
                 "title": info.get("title") or info.get("description", "")[:50] or "Social Media Video",
                 "author": info.get("uploader") or info.get("channel") or "Unknown",
@@ -156,6 +163,7 @@ def extract_metadata(url: str = Query(..., description="The social media video U
                 "duration": info.get("duration"),
                 "best_filesize_bytes": best_size,
                 "worst_filesize_bytes": worst_size,
+                "audio_filesize_bytes": audio_size,
                 "video_link": None,
                 "audio_link": None,
                 "images": False
