@@ -10,9 +10,6 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 from PIL import Image, ImageEnhance, ImageFilter
-import qrcode
-from qrcode import QRCode
-from qrcode.image.pil import PilImage
 
 app = FastAPI(title="Social Media Direct Video Extractor API")
 
@@ -47,13 +44,11 @@ def sanitize_filename(name: str) -> str:
 
 def preprocess_image_for_scanning(image):
     """Advanced image preprocessing for better QR detection"""
-    # Convert to grayscale
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
         gray = image
     
-    # Apply multiple preprocessing techniques to handle various quality issues
     processed_images = []
     
     # 1. Original grayscale
@@ -89,34 +84,9 @@ def preprocess_image_for_scanning(image):
     
     return processed_images
 
-def decode_qr_barcode_from_image(image_data):
-    """Advanced QR decoding with multiple attempts and preprocessing (no external libs needed)"""
+def decode_qr_from_opencv(image_data):
+    """Try OpenCV's QR detector first (best for complex images)"""
     try:
-        # Try with PIL first (most reliable for QR codes)
-        try:
-            pil_image = Image.open(BytesIO(image_data))
-            
-            # Convert to grayscale
-            pil_image = pil_image.convert('L')
-            
-            # Try different contrast levels
-            for factor in [1.0, 1.5, 2.0, 0.5]:
-                try:
-                    enhancer = ImageEnhance.Contrast(pil_image)
-                    enhanced = enhancer.enhance(factor)
-                    
-                    # Try to decode QR from PIL image
-                    from qrcode import QRCode
-                    qr = QRCode()
-                    decoded = qrcode.decode(enhanced)
-                    if decoded:
-                        return decoded.data.decode('utf-8')
-                except:
-                    continue
-        except:
-            pass
-        
-        # Then try with OpenCV preprocessing
         image = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             return None
@@ -125,17 +95,104 @@ def decode_qr_barcode_from_image(image_data):
         
         for processed_img in processed_versions:
             try:
-                # Convert to PIL for QR decoding
-                pil_img = Image.fromarray(processed_img)
+                qr_detector = cv2.QRCodeDetector()
+                data, points, _ = qr_detector.detectAndDecode(processed_img)
+                if data:
+                    return data
+            except:
+                continue
+        
+        return None
+    except:
+        return None
+
+def decode_qr_from_pil(image_data):
+    """Try PIL/qrcode library as fallback"""
+    try:
+        pil_image = Image.open(BytesIO(image_data))
+        pil_image = pil_image.convert('L')
+        
+        # Try different contrast levels
+        for factor in [1.0, 1.5, 2.0, 0.5]:
+            try:
+                enhancer = ImageEnhance.Contrast(pil_image)
+                enhanced = enhancer.enhance(factor)
                 
-                # Try QR decoding
-                from qrcode import QRCode
-                qr = QRCode()
+                # Use pyzbar if available, otherwise use qrcode
+                try:
+                    from pyzbar.pyzbar import decode
+                    decoded = decode(enhanced)
+                    if decoded:
+                        for obj in decoded:
+                            if obj.data:
+                                return obj.data.decode('utf-8')
+                except:
+                    # Fallback to qrcode library
+                    try:
+                        import qrcode
+                        decoded = qrcode.decode(enhanced)
+                        if decoded:
+                            return decoded.data.decode('utf-8')
+                    except:
+                        pass
+            except:
+                continue
+        
+        return None
+    except:
+        return None
+
+def decode_qr_barcode_from_image(image_data):
+    """Advanced QR decoding with multiple methods"""
+    
+    # Method 1: Try OpenCV (best for complex images)
+    result = decode_qr_from_opencv(image_data)
+    if result:
+        return result
+    
+    # Method 2: Try PIL/pyzbar or qrcode
+    result = decode_qr_from_pil(image_data)
+    if result:
+        return result
+    
+    # Method 3: Try both with multiple preprocessing
+    try:
+        image = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            return None
+        
+        processed_versions = preprocess_image_for_scanning(image)
+        
+        for processed_img in processed_versions:
+            # Try OpenCV
+            try:
+                qr_detector = cv2.QRCodeDetector()
+                data, points, _ = qr_detector.detectAndDecode(processed_img)
+                if data:
+                    return data
+            except:
+                pass
+            
+            # Try pyzbar if available
+            try:
+                from pyzbar.pyzbar import decode
+                decoded = decode(processed_img)
+                if decoded:
+                    for obj in decoded:
+                        if obj.data:
+                            return obj.data.decode('utf-8')
+            except:
+                pass
+            
+            # Try qrcode
+            try:
+                import qrcode
+                pil_img = Image.fromarray(processed_img)
                 decoded = qrcode.decode(pil_img)
                 if decoded:
                     return decoded.data.decode('utf-8')
             except:
-                continue
+                pass
         
         return None
     except Exception as e:
@@ -255,36 +312,81 @@ def extract_metadata(url: str = Query(..., description="The social media video U
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,video/webm,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
         },
+        # Force extract all metadata
+        'extract_flat': False,
+        'ignoreerrors': True,
+        'no_color': True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Extract info with download=False but get full metadata
             info = ydl.extract_info(url, download=False)
             if not info:
                 raise HTTPException(status_code=404, detail="Could not extract metadata from this URL.")
 
+            # Get all formats with full info
             formats = info.get("formats", [])
+            
+            # If no formats, try to get it from the main info
+            if not formats and info.get("url"):
+                formats = [info]
+            
+            # Try to get duration from multiple sources
+            duration = info.get("duration")
+            if not duration:
+                # Try to get from formats
+                for f in formats:
+                    if f.get("duration"):
+                        duration = f.get("duration")
+                        break
             
             # Fixed file size extraction - try multiple methods
             valid_sizes = []
             for f in formats:
-                size = f.get("filesize") or f.get("filesize_approx")
+                # Try filesize
+                size = f.get("filesize")
                 if size:
                     valid_sizes.append(size)
-                if not size and f.get("http_headers"):
+                    continue
+                
+                # Try filesize_approx
+                size = f.get("filesize_approx")
+                if size:
+                    valid_sizes.append(size)
+                    continue
+                
+                # Try to get from HTTP headers
+                if f.get("http_headers"):
                     content_length = f.get("http_headers", {}).get("Content-Length")
                     if content_length:
                         try:
                             valid_sizes.append(int(content_length))
                         except (ValueError, TypeError):
                             pass
+                
+                # Try to get from url
+                if f.get("url"):
+                    try:
+                        # Make a HEAD request to get content length
+                        head_response = requests.head(f.get("url"), headers={'User-Agent': USER_AGENT}, timeout=10)
+                        if head_response.status_code == 200:
+                            content_length = head_response.headers.get('Content-Length')
+                            if content_length:
+                                valid_sizes.append(int(content_length))
+                    except:
+                        pass
             
+            # Get best and worst sizes
             best_size = max(valid_sizes) if valid_sizes else None
             worst_size = min(valid_sizes) if valid_sizes else None
 
+            # Get audio stream info
             audio_size = None
+            audio_link = None
             for f in formats:
-                if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
+                if f.get("vcodec") == "none" and f.get("acodec") != "none":
+                    audio_link = f.get("url")
                     audio_size = f.get("filesize") or f.get("filesize_approx")
                     if not audio_size and f.get("http_headers"):
                         content_length = f.get("http_headers", {}).get("Content-Length")
@@ -295,43 +397,54 @@ def extract_metadata(url: str = Query(..., description="The social media video U
                                 pass
                     break
 
-            response_data = {
-                "title": info.get("title") or info.get("description", "")[:50] or "Social Media Video",
-                "author": info.get("uploader") or info.get("channel") or "Unknown",
-                "platform": info.get("extractor_key") or "Unknown",
-                "thumbnail": info.get("thumbnail"),
-                "duration": info.get("duration"),
-                "best_filesize_bytes": best_size,
-                "worst_filesize_bytes": worst_size,
-                "audio_filesize_bytes": audio_size,
-                "video_link": None,
-                "audio_link": None,
-                "images": False
-            }
-
+            # Get best video link
             video_link = None
-            audio_link = None
-
+            # Try to get direct video link from formats
             for f in formats:
-                if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url"):
+                if f.get("vcodec") != "none" and f.get("url"):
                     video_link = f.get("url")
                     break
-
+            
+            # If no video link found, try to get from main info
+            if not video_link:
+                video_link = info.get("url")
+            
+            # If still no video link, try to get from formats with best quality
             if not video_link:
                 video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
                 if video_formats:
-                    video_link = video_formats[-1].get("url")
+                    # Get the one with highest quality
+                    best_video = max(video_formats, key=lambda f: f.get("height", 0) or 0)
+                    video_link = best_video.get("url")
+            
+            # Get thumbnail
+            thumbnail = info.get("thumbnail")
+            if not thumbnail:
+                # Try to find thumbnail in formats
+                for f in formats:
+                    if f.get("thumbnail"):
+                        thumbnail = f.get("thumbnail")
+                        break
 
-            for f in formats:
-                if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
-                    audio_link = f.get("url")
-                    break
-
-            if not video_link:
-                video_link = info.get("url")
-
-            response_data["video_link"] = video_link
-            response_data["audio_link"] = audio_link or video_link
+            response_data = {
+                "title": info.get("title") or info.get("description", "")[:50] or "Social Media Video",
+                "author": info.get("uploader") or info.get("channel") or info.get("creator") or "Unknown",
+                "platform": info.get("extractor_key") or info.get("extractor") or "Unknown",
+                "thumbnail": thumbnail,
+                "duration": duration,
+                "best_filesize_bytes": best_size,
+                "worst_filesize_bytes": worst_size,
+                "audio_filesize_bytes": audio_size,
+                "video_link": video_link,
+                "audio_link": audio_link or video_link,
+                "images": False,
+                # Additional useful info
+                "view_count": info.get("view_count"),
+                "like_count": info.get("like_count"),
+                "upload_date": info.get("upload_date"),
+                "description": info.get("description", "")[:200] if info.get("description") else None,
+                "format_count": len(formats)
+            }
             
             return response_data
 
@@ -358,7 +471,7 @@ async def scan_code(
                 "options": [
                     "?image_url=IMAGE_URL",
                     "?image_base64=BASE64_IMAGE_DATA",
-                    "?image=FULL_IMAGE_STRING"
+                    "?image=FULL_IMAGE_STRING (with or without data:image/ prefix)"
                 ],
                 "example": "/scan-code?image=data:image/png;base64,iVBORw0KGgo..."
             }
@@ -410,9 +523,11 @@ async def scan_code(
 async def scan_code_from_upload(
     file: UploadFile = File(None, description="Image file containing QR code"),
     image_base64: str = Form(None, description="Base64 encoded image data"),
-    image: str = Form(None, description="Full image string")
+    image: str = Form(None, description="Full image string (base64 with or without data URL prefix)")
 ):
-    """Scan QR code from uploaded file or base64 data."""
+    """
+    Scan QR code from uploaded file or base64 data.
+    """
     try:
         image_data = None
         
