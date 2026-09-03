@@ -5,5 +5,5 @@ python-multipart
 opencv-python-headless
 numpy
 pillow
-pyzbar
+qrcode
 requests
